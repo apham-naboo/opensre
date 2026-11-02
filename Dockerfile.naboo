@@ -1,0 +1,47 @@
+# Dockerfile.naboo — hardened, self-contained OpenSRE image for Naboo.
+#
+# Differences vs upstream Dockerfile (which is a thin toolchain + a supervisor
+# that runs `curl -fsSL https://install.opensre.com | bash --main` on every
+# start): this image BAKES a pinned source checkout and runs the gateway
+# directly, with NO runtime phone-home / curl|bash. Pin = the commit this builds
+# from. Telemetry is disabled at the deployment level (OPENSRE_SENTRY_* / PROMPT_LOG).
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Tools the triage path shells out to: git + GitHub CLI (github_cli tool),
+# jq, ripgrep. No Node/Codex (coding agents are disabled — OPENSRE_MAX_CONCURRENT_HEAVY_WORK=0).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash ca-certificates curl git jq less openssh-client procps ripgrep unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG GH_VERSION=2.101.0
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    cd /tmp; \
+    gh_deb="gh_${GH_VERSION}_linux_${arch}.deb"; \
+    curl -fsSLO "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${gh_deb}"; \
+    curl -fsSLO "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_checksums.txt"; \
+    grep " ${gh_deb}$" "gh_${GH_VERSION}_checksums.txt" | sha256sum -c -; \
+    dpkg -i "${gh_deb}"; \
+    rm -rf /tmp/*; \
+    git --version; gh --version
+
+# Bake the source checkout (this IS the version pin) and install it.
+COPY . /app
+RUN pip install --no-cache-dir . \
+    && python -c "import importlib; importlib.import_module('surfaces.entrypoint')"
+
+# Non-root runtime; /data is the writable OPENSRE_HOME.
+RUN useradd --uid 1000 --create-home opensre \
+    && mkdir -p /data && chown opensre:opensre /data
+USER opensre
+ENV MODE=gateway \
+    OPENSRE_HOME=/data \
+    HOME=/home/opensre
+
+EXPOSE 8000
+# Run the gateway directly (same argv the upstream supervisor used), no installer.
+ENTRYPOINT ["opensre"]
+CMD ["gateway", "start", "--foreground"]
